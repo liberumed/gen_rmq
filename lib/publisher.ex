@@ -60,7 +60,8 @@ defmodule GenRMQ.Publisher do
       uri: "amqp://guest:guest@localhost:5672"
       app_id: :my_app_id,
       enable_confirmations: true,
-      max_confirmation_wait_time: 5_000
+      max_confirmation_wait_time: 5_000,
+      retry_delay_function: fn attempt -> :timer.sleep(1000 * attempt) end
     ]
   end
   ```
@@ -71,7 +72,8 @@ defmodule GenRMQ.Publisher do
               uri: String.t(),
               app_id: atom,
               enable_confirmations: boolean,
-              max_confirmation_wait_time: integer
+              max_confirmation_wait_time: integer,
+              retry_delay_function: function
             ]
 
   ##############################################################################
@@ -210,7 +212,14 @@ defmodule GenRMQ.Publisher do
     Process.flag(:trap_exit, true)
     config = apply(module, :init, [])
     state = Map.merge(initial_state, %{config: config})
+
+    state =
+      initial_state
+      |> Map.put(:config, config)
+      |> Map.put(:reconnect_attempt, 0)
+
     send(self(), :init)
+
     {:ok, state}
   end
 
@@ -277,20 +286,20 @@ defmodule GenRMQ.Publisher do
 
   @doc false
   @impl GenServer
-  def handle_info(:init, %{module: module, config: config}) do
+  def handle_info(:init, %{module: module, config: config} = init_state) do
     Logger.info("[#{module}]: Setting up publisher connection and configuration")
-    {:ok, state} = setup_publisher(%{module: module, config: config})
+    {:ok, state} = setup_publisher(init_state)
     {:noreply, state}
   end
 
   @doc false
   @impl GenServer
-  def handle_info({:DOWN, _ref, :process, _pid, reason}, %{module: module, config: config}) do
+  def handle_info({:DOWN, _ref, :process, _pid, reason}, %{module: module} = init_state) do
     Logger.info("[#{module}]: RabbitMQ connection is down! Reason: #{inspect(reason)}")
 
     emit_connection_down_event(module, reason)
 
-    {:ok, state} = setup_publisher(%{module: module, config: config})
+    {:ok, state} = setup_publisher(init_state)
     {:noreply, state}
   end
 
@@ -321,7 +330,7 @@ defmodule GenRMQ.Publisher do
 
     emit_connection_stop_event(start_time, exchange)
 
-    {:ok, %{channel: channel, module: module, config: config, conn: conn}}
+    {:ok, Map.merge(state, %{channel: channel, conn: conn})}
   end
 
   defp emit_connection_down_event(module, reason) do
@@ -387,7 +396,7 @@ defmodule GenRMQ.Publisher do
   defp publish_result(:ok, :timeout), do: {:error, :confirmation_timeout}
   defp publish_result(error, _), do: error
 
-  defp connect(%{module: module, config: config} = state) do
+  defp connect(%{module: module, config: config, reconnect_attempt: attempt} = state) do
     case Connection.open(config[:uri]) do
       {:ok, conn} ->
         Process.monitor(conn.pid)
@@ -395,8 +404,14 @@ defmodule GenRMQ.Publisher do
 
       {:error, e} ->
         Logger.error("[#{module}]: Failed to connect to RabbitMQ, reason: #{inspect(e)}")
-        :timer.sleep(5000)
-        connect(state)
+
+        retry_delay_fn = config[:retry_delay_function] || (&linear_delay/1)
+        next_attempt = attempt + 1
+        retry_delay_fn.(next_attempt)
+
+        state
+        |> Map.put(:reconnect_attempt, next_attempt)
+        |> connect()
     end
   end
 
@@ -422,6 +437,8 @@ defmodule GenRMQ.Publisher do
   defp app_id(config) do
     config[:app_id] || :gen_rmq
   end
+
+  defp linear_delay(attempt), do: :timer.sleep(attempt * 1_000)
 
   ##############################################################################
   ##############################################################################
